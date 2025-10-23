@@ -1,7 +1,9 @@
-import os, json, re, logging
+import os, json, re, logging, sys
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 import gspread
+import pkg_resources
+
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
@@ -62,7 +64,7 @@ def _read_products(ws):
         if not any(row):
             continue
         def get_text(col): return str(row[idx[col]]).strip() if col in idx and idx[col] < len(row) else ""
-        def get_num(col): 
+        def get_num(col):
             try: return float(str(row[idx[col]]).replace(",", ".") or 0)
             except: return 0
         p = {
@@ -84,29 +86,35 @@ def _read_products(ws):
 
 # ----------------- IA -----------------
 def _nlp_parse(text: str) -> Dict[str, Any]:
+    """
+    Intenta usar OpenAI; si no hay key o falla, usa fallback simple por regex.
+    """
     if OPENAI_API_KEY and OpenAI:
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        system = (
-            "Sos un asistente para un sistema de control de stock. "
-            "Analizá el mensaje y devolvé JSON con 'intent' y 'data'. "
-            "intents: 'ajustar_stock', 'reporte', 'faltantes', 'ganancias', 'agregar_producto'. "
-            "Para 'ajustar_stock': {'accion':'agregar'|'descontar','cantidad':int,'query':str,'precio_venta':float opcional}."
-        )
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": text}],
-            response_format={"type": "json_object"},
-            temperature=0
-        )
         try:
-            data = json.loads(resp.choices[0].message.content)
-            return data
-        except:
-            pass
+            client = OpenAI(api_key=OPENAI_API_KEY)
+            system = (
+                "Sos un asistente para un sistema de control de stock. "
+                "Analizá el mensaje y devolvé JSON con 'intent' y 'data'. "
+                "intents: 'ajustar_stock', 'reporte', 'faltantes', 'ganancias', 'agregar_producto'. "
+                "Para 'ajustar_stock': {'accion':'agregar'|'descontar','cantidad':int,'query':str,'precio_venta':float opcional}."
+            )
+            resp = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": text}],
+                response_format={"type": "json_object"},
+                temperature=0
+            )
+            try:
+                data = json.loads(resp.choices[0].message.content)
+                return data
+            except Exception:
+                pass
+        except Exception as e:
+            log.warning(f"OpenAI deshabilitado por error: {e}")
     # fallback simple
     t = text.lower()
     if "faltante" in t: return {"intent": "faltantes", "data": {}}
-    if "reporte" in t: return {"intent": "reporte", "data": {}}
+    if "reporte" in t or "lista" in t: return {"intent": "reporte", "data": {}}
     if "ganancia" in t: return {"intent": "ganancias", "data": {}}
     m_add = re.search(r"(agrega|sumar|entrad[ao])\s+(\d+)", t)
     m_sub = re.search(r"(desconta|vend[íi]|restar|salid[ao])\s+(\d+)", t)
@@ -118,6 +126,10 @@ def _nlp_parse(text: str) -> Dict[str, Any]:
 
 # ----------------- UTIL -----------------
 def _find_product(query: str, products: List[Dict[str, Any]]):
+    """
+    Busca por código, SKU o texto (incluye Producto, Talle y Color).
+    Devuelve un dict si hay 1 match, una lista si hay varios, o None.
+    """
     q = query.strip().lower()
     matches = []
     for p in products:
@@ -137,7 +149,7 @@ def _find_product(query: str, products: List[Dict[str, Any]]):
     return None
 
 def _update_stock(ws, prod, new_stock, idx):
-    col = (idx.get("stock") or 7) + 1
+    col = (idx.get("stock") or 7) + 1  # fallback por si headers cambian
     ws.update_cell(prod["row"], col, new_stock)
 
 def _append_movement(ws_movs, tipo, prod, cantidad, precio_venta, costo_unit):
@@ -163,17 +175,16 @@ def _sum_ganancias(ws_movs) -> float:
 
 def _money(x): return f"${x:,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
 
-# ----------------- HANDLERS -----------------
+# ----------------- HANDLERS BÁSICOS -----------------
 async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "👋 *Bienvenido al bot de Control de Stock*\n\n"
-        "Podés decir cosas como:\n"
+        "👋 *Bot de Control de Stock*\n\n"
+        "Ejemplos:\n"
         "• 'Sumá 3 pantalones talle M azul'\n"
-        "• 'Vendí 2 botines negros 42 a $34000'\n"
+        "• 'Descontá 2 botines negros 42 a $34000'\n"
         "• 'Mostrame los faltantes'\n"
         "• 'Ganancias'\n\n"
-        "Comandos:\n"
-        "/reporte, /faltantes, /ganancias, /agregar, /descontar"
+        "Comandos: /reporte, /faltantes, /ganancias, /ping, /version, /estado"
     )
     await update.message.reply_markdown(msg)
 
@@ -195,7 +206,7 @@ async def _cmd_faltantes(update, context):
     if not falt:
         await update.message.reply_text("✅ No hay faltantes.")
         return
-    text = "🚨 *Productos con bajo stock:*\n"
+    text = "🚨 *Bajo stock:*\n"
     for p in falt:
         text += f"- {p['Producto']} {p['Talle']} {p['Color']} ({p['Stock']} / mín {p['Minimo']})\n"
     await update.message.reply_markdown(text[:4000])
@@ -258,17 +269,93 @@ async def _on_text(update, context):
     else:
         await _cmd_reporte(update, context)
 
+# ----------------- NUEVOS COMANDOS: /ping /version /estado -----------------
+async def _cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        sh, ws_prod, ws_movs = _open_sheet()
+        # simple touch to ensure access
+        _ = ws_prod.title
+        _ = ws_movs.title
+        await update.message.reply_text(f"✅ Bot online\n🧾 Google Sheets OK → '{sh.title}'")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Bot activo, pero sin acceso a Sheets:\n{e}")
+
+async def _cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        pyver = sys.version.split()[0]
+        libs = {
+            "python-telegram-bot": pkg_resources.get_distribution("python-telegram-bot").version,
+            "gspread": pkg_resources.get_distribution("gspread").version,
+            "google-auth": pkg_resources.get_distribution("google-auth").version,
+            "openai": pkg_resources.get_distribution("openai").version if OPENAI_API_KEY else "(deshabilitado)",
+            "httpx": pkg_resources.get_distribution("httpx").version,
+        }
+        msg = f"🧠 *Versión del Bot*\nPython: `{pyver}`\n" + "\n".join([f"{k}: `{v}`" for k,v in libs.items()])
+        await update.message.reply_markdown(msg)
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Error al obtener versiones: {e}")
+
+async def _cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Chequeo integral: Sheets + IA + métricas rápidas.
+    """
+    lines = []
+    # Sheets
+    try:
+        sh, ws_prod, ws_movs = _open_sheet()
+        products, _ = _read_products(ws_prod)
+        falt = [p for p in products if p["Stock"] <= p["Minimo"]]
+        lines.append(f"🧾 Sheets: OK → '{sh.title}'")
+        lines.append(f"📦 Productos: {len(products)} | 🚨 Faltantes: {len(falt)}")
+        # últimos 3 movimientos
+        mov_values = ws_movs.get_all_values()
+        ult = []
+        if mov_values and len(mov_values) > 1:
+            for r in mov_values[-3:]:
+                if r and len(r) >= 11:
+                    ult.append(f"{r[0]} · {r[1]} · {r[3]} {r[4]} {r[5]} · cant {r[7]}")
+        if ult:
+            lines.append("📝 Últimos movimientos:")
+            for u in ult:
+                lines.append(f"  • {u}")
+        else:
+            lines.append("📝 Últimos movimientos: (sin registros)")
+    except Exception as e:
+        lines.append(f"🧾 Sheets: ERROR → {e}")
+
+    # OpenAI
+    try:
+        if OPENAI_API_KEY and OpenAI:
+            client = OpenAI(api_key=OPENAI_API_KEY)
+            # ping liviano al endpoint de modelos
+            _ = client.models.list()
+            lines.append("🤖 IA (OpenAI): OK")
+        else:
+            lines.append("🤖 IA (OpenAI): deshabilitada (sin API key)")
+    except Exception as e:
+        lines.append(f"🤖 IA (OpenAI): ERROR → {e}")
+
+    await update.message.reply_text("\n".join(lines)[:4000])
+
 # ----------------- MAIN -----------------
 def main():
     if not TELEGRAM_TOKEN or not GOOGLE_SHEET_ID:
         raise RuntimeError("Faltan variables de entorno.")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # Comandos
     app.add_handler(CommandHandler("start", _cmd_start))
     app.add_handler(CommandHandler("reporte", _cmd_reporte))
     app.add_handler(CommandHandler("faltantes", _cmd_faltantes))
     app.add_handler(CommandHandler("ganancias", _cmd_ganancias))
+    app.add_handler(CommandHandler("ping", _cmd_ping))
+    app.add_handler(CommandHandler("version", _cmd_version))
+    app.add_handler(CommandHandler("estado", _cmd_estado))
+
+    # Mensajes libres
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
     app.add_handler(MessageHandler(filters.TEXT & filters.REPLY, _on_clarification))
+
     log.info("Bot corriendo…")
     app.run_polling(drop_pending_updates=True)
 
