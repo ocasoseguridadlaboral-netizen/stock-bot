@@ -372,9 +372,8 @@ async def _resolver_y_ajustar(update, context, accion, cantidad, precio_venta, f
     # limpiar pendiente al terminar
     _set_pendiente(context, None)
 
+    # >>> CAMBIO: mensaje sin "Ganancia estimada"
     msg = f"✅ {('Sumé' if delta>0 else 'Desconté')} {abs(delta)} de {prod['Producto']} {prod['Talle']} {prod['Color']} (stock {prod['Stock']}→{new_stock})"
-    if tipo == "salida":
-        msg += f"\nGanancia estimada: {_money((precio_v - costo)*abs(delta))}"
     await update.message.reply_text(msg)
 
 # ----------------- MENSAJES -----------------
@@ -403,9 +402,9 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 costo = float(prod["Costo"] or 0)
                 _append_movement(ws_movs, tipo, prod, abs(delta), precio_v, costo)
                 _set_pendiente(context, None)
+
+                # >>> CAMBIO: mensaje sin "Ganancia estimada"
                 msg = f"✅ {('Sumé' if delta>0 else 'Desconté')} {abs(delta)} de {prod['Producto']} {prod['Talle']} {prod['Color']} (stock {prod['Stock']}→{new_stock})"
-                if tipo == "salida":
-                    msg += f"\nGanancia estimada: {_money((precio_v - costo)*abs(delta))}"
                 await update.message.reply_text(msg)
                 return
 
