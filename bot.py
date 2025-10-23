@@ -1,13 +1,13 @@
-import os, json, re, logging, sys
+import os, json, re, logging, sys, unicodedata
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 import gspread
 import pkg_resources
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-# ==== IA (OpenAI) ====
+# ==== IA (OpenAI) opcional ====
 try:
     from openai import OpenAI
 except Exception:
@@ -27,6 +27,33 @@ MOVS_HEADERS = ["Fecha", "Tipo", "Codigo", "Producto", "Talle", "Color", "Descri
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger("stock-bot")
+
+# ----------------- NORMALIZACIÓN / UTIL -----------------
+def _normalize(s: str) -> str:
+    if s is None:
+        return ""
+    s = s.lower().strip()
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    return re.sub(r"\s+", " ", s)
+
+_SINGULAR_MAP = {
+    "pantalones":"pantalon", "botines":"botin", "zapatillas":"zapatilla",
+    "medias":"media", "camisas":"camisa", "remeras":"remera", "jeans":"jean",
+    "gorras":"gorra", "camperas":"campera", "buzos":"buzo",
+}
+def _singularize(word: str) -> str:
+    w = _normalize(word)
+    if w in _SINGULAR_MAP: return _SINGULAR_MAP[w]
+    # reglas simples
+    if w.endswith("es") and len(w) > 3:
+        return w[:-2]
+    if w.endswith("s") and len(w) > 3:
+        return w[:-1]
+    return w
+
+def _money(x: float) -> str:
+    return f"${x:,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
 
 # ----------------- GOOGLE SHEETS -----------------
 def _gs_client():
@@ -80,76 +107,152 @@ def _read_products(ws):
             "Minimo": int(get_num("minimo")),
             "SKU": get_text("sku")
         }
-        if p["Codigo"] or p["Descripcion"]:
+        if p["Codigo"] or p["Descripcion"] or p["Producto"]:
             products.append(p)
     return products, idx
 
-# ----------------- IA -----------------
+# ----------------- EXTRACCIÓN DE ENTIDADES DESDE EL MENSAJE -----------------
+VERBOS_SUMA = {"compre","compré","compra","agrega","agregá","agregar","sumar","sumá","suma","entrada","entraron","ingresa","ingresá","agrego","ingreso"}
+VERBOS_RESTA = {"vendi","vendí","venta","vendimos","desconta","descontá","descontar","restar","resta","salida","salieron","retiro","retiré","descuento"}
+
+def _detectar_intencion(text_nrm: str) -> Optional[str]:
+    tokens = text_nrm.split()
+    if any(v in tokens for v in VERBOS_RESTA): return "descontar"
+    if any(v in tokens for v in VERBOS_SUMA): return "agregar"
+    # heurística: si aparece "vend..." en el texto
+    if re.search(r"\bvend", text_nrm): return "descontar"
+    if re.search(r"\bcompr", text_nrm): return "agregar"
+    return None
+
+def _extraer_cantidad(text_nrm: str) -> int:
+    m = re.search(r"\b(\d{1,4})\b", text_nrm)
+    if m:
+        try: return int(m.group(1))
+        except: pass
+    return 1
+
+def _extraer_precio(text_nrm: str) -> Optional[float]:
+    m = re.search(r"\$?\s*([\d\.]{1,3}(?:[\.\s]?\d{3})*(?:[\,\.]\d{1,2})?)", text_nrm)
+    if m:
+        val = m.group(1).replace(".", "").replace(" ", "").replace(",", ".")
+        try:
+            f = float(val)
+            return f if f > 0 else None
+        except:
+            return None
+    return None
+
+def _catalogo_valores(products: List[Dict[str,Any]]) -> Tuple[List[str], List[str], List[str]]:
+    prods = sorted({ _normalize(p.get("Producto","")) for p in products if p.get("Producto") }, key=len, reverse=True)
+    colores = sorted({ _normalize(p.get("Color","")) for p in products if p.get("Color") }, key=len, reverse=True)
+    talles = sorted({ _normalize(p.get("Talle","")) for p in products if p.get("Talle") }, key=len, reverse=True)
+    return prods, colores, talles
+
+def _pick_one_from(text_nrm: str, candidates: List[str]) -> Optional[str]:
+    # match exact substring de candidato más largo primero
+    for c in candidates:
+        if not c: 
+            continue
+        if c in text_nrm:
+            return c
+    return None
+
+def _extract_entities_from_query(products: List[Dict[str,Any]], text: str) -> Dict[str, Optional[str]]:
+    t = _normalize(text)
+    # singularizar cada token para mejorar match (“pantalones” => “pantalon”)
+    tokens = [_singularize(tok) for tok in t.split()]
+    t_sing = " ".join(tokens)
+
+    prods_cat, colores_cat, talles_cat = _catalogo_valores(products)
+
+    producto = _pick_one_from(t_sing, prods_cat)
+    color = _pick_one_from(t_sing, colores_cat)
+
+    # talle: primero “talle X” o “t X”
+    m = re.search(r"\b(?:talle|t)\s*([a-z0-9\-]+)\b", t_sing)
+    if m:
+        talle = m.group(1)
+    else:
+        # si en catálogo hay talles numéricos/letras, buscar token exacto
+        talle = None
+        for tok in tokens:
+            if tok in talles_cat:
+                talle = tok; break
+            # números como 44, 42, 36
+            if re.fullmatch(r"\d{2}", tok) and tok in talles_cat:
+                talle = tok; break
+
+    return {"Producto": producto, "Color": color, "Talle": talle}
+
+# ----------------- BÚSQUEDA Y MATCHING -----------------
+def _filtrar_por_campos(products: List[Dict[str,Any]], f: Dict[str, Optional[str]]) -> List[Dict[str,Any]]:
+    # filtra por campos especificados (normalizados)
+    def ok(p, k):
+        v = _normalize(p.get(k,""))
+        q = _normalize(f.get(k) or "")
+        return (not q) or (q and q == v)
+
+    res = [p for p in products if ok(p,"Producto") and ok(p,"Color") and ok(p,"Talle")]
+    return res
+
+def _buscar_textual(products: List[Dict[str,Any]], query: str) -> List[Dict[str,Any]]:
+    q = _normalize(query)
+    toks = set(q.split())
+    out = []
+    for p in products:
+        texto = _normalize(" ".join([
+            p.get("Codigo",""), p.get("Descripcion",""), p.get("Producto",""),
+            p.get("Talle",""), p.get("Color",""), p.get("SKU","")
+        ]))
+        if q in texto or toks.issubset(set(texto.split())):
+            out.append(p)
+    return out
+
+# ----------------- IA (opcional) -----------------
 def _nlp_parse(text: str) -> Dict[str, Any]:
     """
-    Intenta usar OpenAI; si no hay key o falla, usa fallback simple por regex.
+    Intentamos OpenAI; si falla o no hay key, usamos reglas locales robustas.
     """
+    # 1) Reglas locales mejoradas
+    t = _normalize(text)
+    accion = _detectar_intencion(t)  # "agregar" | "descontar" | None
+    cantidad = _extraer_cantidad(t)
+    precio = _extraer_precio(t)  # puede ser None
+
+    base = {"intent":"ajustar_stock","data":{"accion":accion,"cantidad":cantidad,"query":text,"precio_venta":precio}}
+
     if OPENAI_API_KEY and OpenAI:
         try:
             client = OpenAI(api_key=OPENAI_API_KEY)
             system = (
-                "Sos un asistente para un sistema de control de stock. "
-                "Analizá el mensaje y devolvé JSON con 'intent' y 'data'. "
-                "intents: 'ajustar_stock', 'reporte', 'faltantes', 'ganancias', 'agregar_producto'. "
-                "Para 'ajustar_stock': {'accion':'agregar'|'descontar','cantidad':int,'query':str,'precio_venta':float opcional}."
+                "Sos un parser de español para control de stock. "
+                "Devolvé JSON con 'intent' y 'data'. "
+                "intents: 'ajustar_stock','reporte','faltantes','ganancias'. "
+                "Para 'ajustar_stock' incluí: {'accion':'agregar'|'descontar','cantidad':int,'query':str,'precio_venta':float|null}."
             )
             resp = client.chat.completions.create(
                 model=OPENAI_MODEL,
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": text}],
-                response_format={"type": "json_object"},
+                messages=[{"role":"system","content":system},{"role":"user","content":text}],
+                response_format={"type":"json_object"},
                 temperature=0
             )
-            try:
-                data = json.loads(resp.choices[0].message.content)
-                return data
-            except Exception:
-                pass
+            data = json.loads(resp.choices[0].message.content)
+            # combinamos: si OpenAI no detectó bien la acción o cantidad, usamos nuestra heurística
+            d = data.get("data",{})
+            if not data.get("intent"): data["intent"] = "ajustar_stock"
+            if not d.get("accion"): d["accion"] = accion
+            if not d.get("cantidad"): d["cantidad"] = cantidad
+            if "precio_venta" not in d: d["precio_venta"] = precio
+            data["data"] = d
+            return data
         except Exception as e:
             log.warning(f"OpenAI deshabilitado por error: {e}")
-    # fallback simple
-    t = text.lower()
-    if "faltante" in t: return {"intent": "faltantes", "data": {}}
-    if "reporte" in t or "lista" in t: return {"intent": "reporte", "data": {}}
-    if "ganancia" in t: return {"intent": "ganancias", "data": {}}
-    m_add = re.search(r"(agrega|sumar|entrad[ao])\s+(\d+)", t)
-    m_sub = re.search(r"(desconta|vend[íi]|restar|salid[ao])\s+(\d+)", t)
-    if m_add:
-        return {"intent": "ajustar_stock", "data": {"accion": "agregar", "cantidad": int(m_add.group(2)), "query": t}}
-    if m_sub:
-        return {"intent": "ajustar_stock", "data": {"accion": "descontar", "cantidad": int(m_sub.group(2)), "query": t}}
-    return {"intent": "reporte", "data": {}}
 
-# ----------------- UTIL -----------------
-def _find_product(query: str, products: List[Dict[str, Any]]):
-    """
-    Busca por código, SKU o texto (incluye Producto, Talle y Color).
-    Devuelve un dict si hay 1 match, una lista si hay varios, o None.
-    """
-    q = query.strip().lower()
-    matches = []
-    for p in products:
-        texto = f"{p.get('Codigo','')} {p.get('Descripcion','')} {p.get('Producto','')} {p.get('Talle','')} {p.get('Color','')} {p.get('SKU','')}".lower()
-        if q in texto:
-            matches.append(p)
-    if not matches:
-        palabras = q.split()
-        for p in products:
-            texto = f"{p.get('Descripcion','')} {p.get('Producto','')} {p.get('Talle','')} {p.get('Color','')}".lower()
-            if all(w in texto for w in palabras):
-                matches.append(p)
-    if len(matches) == 1:
-        return matches[0]
-    elif len(matches) > 1:
-        return matches
-    return None
+    return base
 
+# ----------------- MOVIMIENTOS / STOCK -----------------
 def _update_stock(ws, prod, new_stock, idx):
-    col = (idx.get("stock") or 7) + 1  # fallback por si headers cambian
+    col = (idx.get("stock") or 7) + 1
     ws.update_cell(prod["row"], col, new_stock)
 
 def _append_movement(ws_movs, tipo, prod, cantidad, precio_venta, costo_unit):
@@ -173,17 +276,15 @@ def _sum_ganancias(ws_movs) -> float:
         except: pass
     return total
 
-def _money(x): return f"${x:,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
-
 # ----------------- HANDLERS BÁSICOS -----------------
 async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "👋 *Bot de Control de Stock*\n\n"
         "Ejemplos:\n"
-        "• 'Sumá 3 pantalones talle M azul'\n"
-        "• 'Descontá 2 botines negros 42 a $34000'\n"
-        "• 'Mostrame los faltantes'\n"
-        "• 'Ganancias'\n\n"
+        "• 'Sumá 3 pantalones verde 44'\n"
+        "• 'Vendí 2 botines negros 42 a $34000'\n"
+        "• 'Compré 5 pantalones verde clasico 44'\n"
+        "• 'Mostrame los faltantes' | 'Ganancias'\n\n"
         "Comandos: /reporte, /faltantes, /ganancias, /ping, /version, /estado"
     )
     await update.message.reply_markdown(msg)
@@ -216,66 +317,133 @@ async def _cmd_ganancias(update, context):
     total = _sum_ganancias(ws_movs)
     await update.message.reply_text(f"💰 Ganancia total: {_money(total)}")
 
-# ----------------- AJUSTES DE STOCK -----------------
-async def _ajustar_stock(update, accion, query, cantidad, precio_venta):
-    sh, ws_prod, ws_movs = _open_sheet()
-    products, idx = _read_products(ws_prod)
-    prod = _find_product(query, products)
-    if not prod:
-        await update.message.reply_text(f"No encontré coincidencias para: \"{query}\"")
+# ----------------- SLOT-FILLING Y AJUSTE -----------------
+def _estado_pendiente(context: ContextTypes.DEFAULT_TYPE) -> Optional[Dict[str,Any]]:
+    return context.user_data.get("pending_adjust")
+
+def _set_pendiente(context: ContextTypes.DEFAULT_TYPE, data: Optional[Dict[str,Any]]):
+    if data is None:
+        context.user_data.pop("pending_adjust", None)
+    else:
+        context.user_data["pending_adjust"] = data
+
+def _siguiente_slot_faltante(filtro: Dict[str, Optional[str]]) -> Optional[str]:
+    for k in ["Producto","Talle","Color"]:
+        if not filtro.get(k):
+            return k
+    return None
+
+async def _preguntar_slot(update: Update, slot: str, products: List[Dict[str,Any]]):
+    if slot == "Producto":
+        opciones = sorted({p["Producto"] for p in products if p.get("Producto")})
+        extra = f"\nEjemplos: {', '.join(opciones[:5])}" if opciones else ""
+        await update.message.reply_text(f"¿Qué *producto* es? (ej. 'pantalon clasico'){extra}", parse_mode="Markdown")
+    elif slot == "Talle":
+        opciones = sorted({p["Talle"] for p in products if p.get("Talle")})
+        extra = f"\nTalles: {', '.join(opciones[:10])}" if opciones else ""
+        await update.message.reply_text(f"¿Qué *talle*?", parse_mode="Markdown")
+    elif slot == "Color":
+        opciones = sorted({p["Color"] for p in products if p.get("Color")})
+        extra = f"\nColores: {', '.join(opciones[:10])}" if opciones else ""
+        await update.message.reply_text(f"¿Qué *color*?", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("Necesito un dato más…")
+
+async def _resolver_y_ajustar(update, context, accion, cantidad, precio_venta, filtro, products, idx, ws_prod, ws_movs):
+    # filtrar por lo que ya tengo
+    candidatos = _filtrar_por_campos(products, filtro)
+    if not candidatos:
+        # último intento: búsqueda textual completa
+        candidatos = _buscar_textual(products, " ".join([v for v in filtro.values() if v]))
+
+    if not candidatos:
+        slot = _siguiente_slot_faltante(filtro)
+        if slot:
+            await _preguntar_slot(update, slot, products)
+            _set_pendiente(context, {"accion":accion,"cantidad":cantidad,"precio_venta":precio_venta,"filtro":filtro})
+            return
+        await update.message.reply_text("No encontré coincidencias con esos datos. Probá indicar *producto, talle y color*.", parse_mode="Markdown")
         return
-    if isinstance(prod, list):
-        opciones = "\n".join([
-            f"- {p['Producto']} {p['Talle']} {p['Color']} [Código: {p['Codigo'] or 's/cod'}]" for p in prod
-        ])
-        await update.message.reply_text(
-            f"Encontré varios productos que coinciden con \"{query}\":\n{opciones}\n\nEscribí el *código* exacto."
-        )
-        context.user_data["pending_action"] = {"accion": accion, "cantidad": cantidad, "precio_venta": precio_venta}
+
+    if len(candidatos) > 1:
+        lista = "\n".join([f"- {p['Producto']} {p['Talle']} {p['Color']} [código: {p.get('Codigo') or 's/cod'}]" for p in candidatos[:10]])
+        await update.message.reply_text(f"Encontré varias coincidencias:\n{lista}\n\nDecime el *código* exacto o especificá mejor (p. ej. producto y color).", parse_mode="Markdown")
+        _set_pendiente(context, {"accion":accion,"cantidad":cantidad,"precio_venta":precio_venta,"filtro":filtro})
         return
+
+    # 1 solo producto → ajustar
+    prod = candidatos[0]
     delta = abs(cantidad) if accion == "agregar" else -abs(cantidad)
     new_stock = max(0, prod["Stock"] + delta)
     _update_stock(ws_prod, prod, new_stock, idx)
     tipo = "entrada" if delta > 0 else "salida"
     precio_v = float(precio_venta or prod["Precio"] or 0)
     costo = float(prod["Costo"] or 0)
-    _append_movement(ws_movs, tipo, prod, delta, precio_v, costo)
+    _append_movement(ws_movs, tipo, prod, abs(delta), precio_v, costo)
+
     msg = f"✅ {('Sumé' if delta>0 else 'Desconté')} {abs(delta)} de {prod['Producto']} {prod['Talle']} {prod['Color']} (stock {prod['Stock']}→{new_stock})"
     if tipo == "salida":
         msg += f"\nGanancia estimada: {_money((precio_v - costo)*abs(delta))}"
     await update.message.reply_text(msg)
 
-async def _on_clarification(update, context):
-    text = update.message.text.strip()
-    pending = context.user_data.pop("pending_action", None)
-    if not pending:
-        await update.message.reply_text("No hay acción pendiente.")
-        return
-    await _ajustar_stock(update, pending["accion"], text, pending["cantidad"], pending.get("precio_venta"))
-
-async def _on_text(update, context):
+async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
+    sh, ws_prod, ws_movs = _open_sheet()
+    products, idx = _read_products(ws_prod)
+
+    # si estoy completando slots
+    pending = _estado_pendiente(context)
+    if pending:
+        # actualizar el filtro con lo que respondió el usuario
+        t = _normalize(text)
+        slot = _siguiente_slot_faltante(pending["filtro"])
+        if slot:
+            # intentar mapear respuesta al catálogo
+            if slot == "Producto":
+                # permitir singular plural
+                pending["filtro"]["Producto"] = _pick_one_from(" "+_singularize(t)+" ", [_normalize(p["Producto"]) for p in products if p.get("Producto")])
+            elif slot == "Talle":
+                pending["filtro"]["Talle"] = t.strip()
+            elif slot == "Color":
+                pending["filtro"]["Color"] = _pick_one_from(" "+t+" ", [_normalize(p["Color"]) for p in products if p.get("Color")]) or t.strip()
+        # reintentar resolver
+        await _resolver_y_ajustar(update, context, pending["accion"], int(pending["cantidad"]), pending.get("precio_venta"), pending["filtro"], products, idx, ws_prod, ws_movs)
+        return
+
     parsed = _nlp_parse(text)
     intent = parsed.get("intent")
     data = parsed.get("data", {})
-    if intent == "ajustar_stock":
-        await _ajustar_stock(update, data.get("accion"), data.get("query"), int(data.get("cantidad",0)), data.get("precio_venta"))
-    elif intent == "reporte":
-        await _cmd_reporte(update, context)
-    elif intent == "faltantes":
-        await _cmd_faltantes(update, context)
-    elif intent == "ganancias":
-        await _cmd_ganancias(update, context)
-    else:
-        await _cmd_reporte(update, context)
 
-# ----------------- NUEVOS COMANDOS: /ping /version /estado -----------------
+    if intent in ("reporte","faltantes","ganancias"):
+        if intent == "reporte":
+            await _cmd_reporte(update, context)
+        elif intent == "faltantes":
+            await _cmd_faltantes(update, context)
+        else:
+            await _cmd_ganancias(update, context)
+        return
+
+    # ajustar_stock
+    accion = data.get("accion")
+    cantidad = int(data.get("cantidad") or 1)
+    precio_venta = data.get("precio_venta")
+
+    # extraer entidades desde el texto con catálogo real
+    filtro = _extract_entities_from_query(products, text)
+
+    # si falta acción, decidir por heurística (por defecto: venta = descontar)
+    if not accion:
+        accion = "descontar"  # elección conservadora si dice “vendí …”
+        if re.search(r"\bcompr|agreg|sum", _normalize(text)): accion = "agregar"
+
+    # si faltan slots, pregunto de a uno antes de fallar
+    await _resolver_y_ajustar(update, context, accion, cantidad, precio_venta, filtro, products, idx, ws_prod, ws_movs)
+
+# ----------------- /ping /version /estado -----------------
 async def _cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         sh, ws_prod, ws_movs = _open_sheet()
-        # simple touch to ensure access
-        _ = ws_prod.title
-        _ = ws_movs.title
+        _ = ws_prod.title; _ = ws_movs.title
         await update.message.reply_text(f"✅ Bot online\n🧾 Google Sheets OK → '{sh.title}'")
     except Exception as e:
         await update.message.reply_text(f"⚠️ Bot activo, pero sin acceso a Sheets:\n{e}")
@@ -296,9 +464,6 @@ async def _cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Error al obtener versiones: {e}")
 
 async def _cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Chequeo integral: Sheets + IA + métricas rápidas.
-    """
     lines = []
     # Sheets
     try:
@@ -307,34 +472,25 @@ async def _cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
         falt = [p for p in products if p["Stock"] <= p["Minimo"]]
         lines.append(f"🧾 Sheets: OK → '{sh.title}'")
         lines.append(f"📦 Productos: {len(products)} | 🚨 Faltantes: {len(falt)}")
-        # últimos 3 movimientos
         mov_values = ws_movs.get_all_values()
         ult = []
         if mov_values and len(mov_values) > 1:
             for r in mov_values[-3:]:
                 if r and len(r) >= 11:
                     ult.append(f"{r[0]} · {r[1]} · {r[3]} {r[4]} {r[5]} · cant {r[7]}")
-        if ult:
-            lines.append("📝 Últimos movimientos:")
-            for u in ult:
-                lines.append(f"  • {u}")
-        else:
-            lines.append("📝 Últimos movimientos: (sin registros)")
+        lines.append("📝 Últimos movimientos:" + ("\n  • " + "\n  • ".join(ult) if ult else " (sin registros)"))
     except Exception as e:
         lines.append(f"🧾 Sheets: ERROR → {e}")
-
     # OpenAI
     try:
         if OPENAI_API_KEY and OpenAI:
             client = OpenAI(api_key=OPENAI_API_KEY)
-            # ping liviano al endpoint de modelos
             _ = client.models.list()
             lines.append("🤖 IA (OpenAI): OK")
         else:
             lines.append("🤖 IA (OpenAI): deshabilitada (sin API key)")
     except Exception as e:
         lines.append(f"🤖 IA (OpenAI): ERROR → {e}")
-
     await update.message.reply_text("\n".join(lines)[:4000])
 
 # ----------------- MAIN -----------------
@@ -352,9 +508,8 @@ def main():
     app.add_handler(CommandHandler("version", _cmd_version))
     app.add_handler(CommandHandler("estado", _cmd_estado))
 
-    # Mensajes libres
+    # Mensajes libres y aclaraciones (slot-filling)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
-    app.add_handler(MessageHandler(filters.TEXT & filters.REPLY, _on_clarification))
 
     log.info("Bot corriendo…")
     app.run_polling(drop_pending_updates=True)
