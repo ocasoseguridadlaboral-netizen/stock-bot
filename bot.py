@@ -45,7 +45,6 @@ _SINGULAR_MAP = {
 def _singularize(word: str) -> str:
     w = _normalize(word)
     if w in _SINGULAR_MAP: return _SINGULAR_MAP[w]
-    # reglas simples
     if w.endswith("es") and len(w) > 3:
         return w[:-2]
     if w.endswith("s") and len(w) > 3:
@@ -54,6 +53,10 @@ def _singularize(word: str) -> str:
 
 def _money(x: float) -> str:
     return f"${x:,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
+
+def _is_probable_code(text: str) -> bool:
+    t = _normalize(text)
+    return bool(re.fullmatch(r"[a-z0-9\-]{1,12}", t))
 
 # ----------------- GOOGLE SHEETS -----------------
 def _gs_client():
@@ -111,7 +114,70 @@ def _read_products(ws):
             products.append(p)
     return products, idx
 
-# ----------------- EXTRACCIÓN DE ENTIDADES DESDE EL MENSAJE -----------------
+# ----------------- BÚSQUEDAS -----------------
+def _find_by_code(code: str, products: List[Dict[str,Any]]) -> Optional[Dict[str,Any]]:
+    c = _normalize(code)
+    for p in products:
+        if _normalize(p.get("Codigo","")) == c or _normalize(p.get("SKU","")) == c:
+            return p
+    return None
+
+def _catalogo_valores(products: List[Dict[str,Any]]) -> Tuple[List[str], List[str], List[str]]:
+    prods = sorted({ _normalize(p.get("Producto","")) for p in products if p.get("Producto") }, key=len, reverse=True)
+    colores = sorted({ _normalize(p.get("Color","")) for p in products if p.get("Color") }, key=len, reverse=True)
+    talles = sorted({ _normalize(p.get("Talle","")) for p in products if p.get("Talle") }, key=len, reverse=True)
+    return prods, colores, talles
+
+def _pick_one_from(text_nrm: str, candidates: List[str]) -> Optional[str]:
+    for c in candidates:
+        if c and c in text_nrm:
+            return c
+    return None
+
+def _extract_entities_from_query(products: List[Dict[str,Any]], text: str) -> Dict[str, Optional[str]]:
+    t = _normalize(text)
+    tokens = [_singularize(tok) for tok in t.split()]
+    t_sing = " ".join(tokens)
+
+    prods_cat, colores_cat, talles_cat = _catalogo_valores(products)
+
+    producto = _pick_one_from(t_sing, prods_cat)
+    color = _pick_one_from(t_sing, colores_cat)
+
+    m = re.search(r"\b(?:talle|t)\s*([a-z0-9\-]+)\b", t_sing)
+    if m:
+        talle = m.group(1)
+    else:
+        talle = None
+        for tok in tokens:
+            if tok in talles_cat:
+                talle = tok; break
+            if re.fullmatch(r"\d{2}", tok) and tok in talles_cat:
+                talle = tok; break
+
+    return {"Producto": producto, "Color": color, "Talle": talle}
+
+def _filtrar_por_campos(products: List[Dict[str,Any]], f: Dict[str, Optional[str]]) -> List[Dict[str,Any]]:
+    def ok(p, k):
+        v = _normalize(p.get(k,""))
+        q = _normalize(f.get(k) or "")
+        return (not q) or (q and q == v)
+    return [p for p in products if ok(p,"Producto") and ok(p,"Color") and ok(p,"Talle")]
+
+def _buscar_textual(products: List[Dict[str,Any]], query: str) -> List[Dict[str,Any]]:
+    q = _normalize(query)
+    toks = set(q.split())
+    out = []
+    for p in products:
+        texto = _normalize(" ".join([
+            p.get("Codigo",""), p.get("Descripcion",""), p.get("Producto",""),
+            p.get("Talle",""), p.get("Color",""), p.get("SKU","")
+        ]))
+        if q in texto or toks.issubset(set(texto.split())):
+            out.append(p)
+    return out
+
+# ----------------- INTENCIÓN / ENTIDADES (IA opcional) -----------------
 VERBOS_SUMA = {"compre","compré","compra","agrega","agregá","agregar","sumar","sumá","suma","entrada","entraron","ingresa","ingresá","agrego","ingreso"}
 VERBOS_RESTA = {"vendi","vendí","venta","vendimos","desconta","descontá","descontar","restar","resta","salida","salieron","retiro","retiré","descuento"}
 
@@ -119,7 +185,6 @@ def _detectar_intencion(text_nrm: str) -> Optional[str]:
     tokens = text_nrm.split()
     if any(v in tokens for v in VERBOS_RESTA): return "descontar"
     if any(v in tokens for v in VERBOS_SUMA): return "agregar"
-    # heurística: si aparece "vend..." en el texto
     if re.search(r"\bvend", text_nrm): return "descontar"
     if re.search(r"\bcompr", text_nrm): return "agregar"
     return None
@@ -142,83 +207,11 @@ def _extraer_precio(text_nrm: str) -> Optional[float]:
             return None
     return None
 
-def _catalogo_valores(products: List[Dict[str,Any]]) -> Tuple[List[str], List[str], List[str]]:
-    prods = sorted({ _normalize(p.get("Producto","")) for p in products if p.get("Producto") }, key=len, reverse=True)
-    colores = sorted({ _normalize(p.get("Color","")) for p in products if p.get("Color") }, key=len, reverse=True)
-    talles = sorted({ _normalize(p.get("Talle","")) for p in products if p.get("Talle") }, key=len, reverse=True)
-    return prods, colores, talles
-
-def _pick_one_from(text_nrm: str, candidates: List[str]) -> Optional[str]:
-    # match exact substring de candidato más largo primero
-    for c in candidates:
-        if not c: 
-            continue
-        if c in text_nrm:
-            return c
-    return None
-
-def _extract_entities_from_query(products: List[Dict[str,Any]], text: str) -> Dict[str, Optional[str]]:
-    t = _normalize(text)
-    # singularizar cada token para mejorar match (“pantalones” => “pantalon”)
-    tokens = [_singularize(tok) for tok in t.split()]
-    t_sing = " ".join(tokens)
-
-    prods_cat, colores_cat, talles_cat = _catalogo_valores(products)
-
-    producto = _pick_one_from(t_sing, prods_cat)
-    color = _pick_one_from(t_sing, colores_cat)
-
-    # talle: primero “talle X” o “t X”
-    m = re.search(r"\b(?:talle|t)\s*([a-z0-9\-]+)\b", t_sing)
-    if m:
-        talle = m.group(1)
-    else:
-        # si en catálogo hay talles numéricos/letras, buscar token exacto
-        talle = None
-        for tok in tokens:
-            if tok in talles_cat:
-                talle = tok; break
-            # números como 44, 42, 36
-            if re.fullmatch(r"\d{2}", tok) and tok in talles_cat:
-                talle = tok; break
-
-    return {"Producto": producto, "Color": color, "Talle": talle}
-
-# ----------------- BÚSQUEDA Y MATCHING -----------------
-def _filtrar_por_campos(products: List[Dict[str,Any]], f: Dict[str, Optional[str]]) -> List[Dict[str,Any]]:
-    # filtra por campos especificados (normalizados)
-    def ok(p, k):
-        v = _normalize(p.get(k,""))
-        q = _normalize(f.get(k) or "")
-        return (not q) or (q and q == v)
-
-    res = [p for p in products if ok(p,"Producto") and ok(p,"Color") and ok(p,"Talle")]
-    return res
-
-def _buscar_textual(products: List[Dict[str,Any]], query: str) -> List[Dict[str,Any]]:
-    q = _normalize(query)
-    toks = set(q.split())
-    out = []
-    for p in products:
-        texto = _normalize(" ".join([
-            p.get("Codigo",""), p.get("Descripcion",""), p.get("Producto",""),
-            p.get("Talle",""), p.get("Color",""), p.get("SKU","")
-        ]))
-        if q in texto or toks.issubset(set(texto.split())):
-            out.append(p)
-    return out
-
-# ----------------- IA (opcional) -----------------
 def _nlp_parse(text: str) -> Dict[str, Any]:
-    """
-    Intentamos OpenAI; si falla o no hay key, usamos reglas locales robustas.
-    """
-    # 1) Reglas locales mejoradas
     t = _normalize(text)
-    accion = _detectar_intencion(t)  # "agregar" | "descontar" | None
+    accion = _detectar_intencion(t)
     cantidad = _extraer_cantidad(t)
-    precio = _extraer_precio(t)  # puede ser None
-
+    precio = _extraer_precio(t)
     base = {"intent":"ajustar_stock","data":{"accion":accion,"cantidad":cantidad,"query":text,"precio_venta":precio}}
 
     if OPENAI_API_KEY and OpenAI:
@@ -226,8 +219,7 @@ def _nlp_parse(text: str) -> Dict[str, Any]:
             client = OpenAI(api_key=OPENAI_API_KEY)
             system = (
                 "Sos un parser de español para control de stock. "
-                "Devolvé JSON con 'intent' y 'data'. "
-                "intents: 'ajustar_stock','reporte','faltantes','ganancias'. "
+                "Devolvé JSON con 'intent' y 'data'. intents: 'ajustar_stock','reporte','faltantes','ganancias'. "
                 "Para 'ajustar_stock' incluí: {'accion':'agregar'|'descontar','cantidad':int,'query':str,'precio_venta':float|null}."
             )
             resp = client.chat.completions.create(
@@ -237,7 +229,6 @@ def _nlp_parse(text: str) -> Dict[str, Any]:
                 temperature=0
             )
             data = json.loads(resp.choices[0].message.content)
-            # combinamos: si OpenAI no detectó bien la acción o cantidad, usamos nuestra heurística
             d = data.get("data",{})
             if not data.get("intent"): data["intent"] = "ajustar_stock"
             if not d.get("accion"): d["accion"] = accion
@@ -317,7 +308,7 @@ async def _cmd_ganancias(update, context):
     total = _sum_ganancias(ws_movs)
     await update.message.reply_text(f"💰 Ganancia total: {_money(total)}")
 
-# ----------------- SLOT-FILLING Y AJUSTE -----------------
+# ----------------- SLOT-FILLING -----------------
 def _estado_pendiente(context: ContextTypes.DEFAULT_TYPE) -> Optional[Dict[str,Any]]:
     return context.user_data.get("pending_adjust")
 
@@ -335,43 +326,40 @@ def _siguiente_slot_faltante(filtro: Dict[str, Optional[str]]) -> Optional[str]:
 
 async def _preguntar_slot(update: Update, slot: str, products: List[Dict[str,Any]]):
     if slot == "Producto":
-        opciones = sorted({p["Producto"] for p in products if p.get("Producto")})
-        extra = f"\nEjemplos: {', '.join(opciones[:5])}" if opciones else ""
-        await update.message.reply_text(f"¿Qué *producto* es? (ej. 'pantalon clasico'){extra}", parse_mode="Markdown")
+        await update.message.reply_text("¿Qué *producto* es? (ej. 'pantalon clasico')", parse_mode="Markdown")
     elif slot == "Talle":
-        opciones = sorted({p["Talle"] for p in products if p.get("Talle")})
-        extra = f"\nTalles: {', '.join(opciones[:10])}" if opciones else ""
-        await update.message.reply_text(f"¿Qué *talle*?", parse_mode="Markdown")
+        await update.message.reply_text("¿Qué *talle*?", parse_mode="Markdown")
     elif slot == "Color":
-        opciones = sorted({p["Color"] for p in products if p.get("Color")})
-        extra = f"\nColores: {', '.join(opciones[:10])}" if opciones else ""
-        await update.message.reply_text(f"¿Qué *color*?", parse_mode="Markdown")
+        await update.message.reply_text("¿Qué *color*?", parse_mode="Markdown")
     else:
         await update.message.reply_text("Necesito un dato más…")
 
 async def _resolver_y_ajustar(update, context, accion, cantidad, precio_venta, filtro, products, idx, ws_prod, ws_movs):
-    # filtrar por lo que ya tengo
+    # 1) Intento por filtro exacto
     candidatos = _filtrar_por_campos(products, filtro)
     if not candidatos:
-        # último intento: búsqueda textual completa
+        # 2) Intento textual con lo que haya
         candidatos = _buscar_textual(products, " ".join([v for v in filtro.values() if v]))
 
     if not candidatos:
         slot = _siguiente_slot_faltante(filtro)
         if slot:
             await _preguntar_slot(update, slot, products)
-            _set_pendiente(context, {"accion":accion,"cantidad":cantidad,"precio_venta":precio_venta,"filtro":filtro})
+            _set_pendiente(context, {"accion":accion,"cantidad":cantidad,"precio_venta":precio_venta,"filtro":filtro,"t":datetime.now().timestamp()})
             return
-        await update.message.reply_text("No encontré coincidencias con esos datos. Probá indicar *producto, talle y color*.", parse_mode="Markdown")
+        await update.message.reply_text("No encontré coincidencias con esos datos. Indicá *producto, talle y color*.", parse_mode="Markdown")
         return
 
     if len(candidatos) > 1:
-        lista = "\n".join([f"- {p['Producto']} {p['Talle']} {p['Color']} [código: {p.get('Codigo') or 's/cod'}]" for p in candidatos[:10]])
-        await update.message.reply_text(f"Encontré varias coincidencias:\n{lista}\n\nDecime el *código* exacto o especificá mejor (p. ej. producto y color).", parse_mode="Markdown")
-        _set_pendiente(context, {"accion":accion,"cantidad":cantidad,"precio_venta":precio_venta,"filtro":filtro})
+        lista = "\n".join([f"- {p['Producto']} {p['Talle']} {p['Color']} código: {p.get('Codigo') or 's/cod'}" for p in candidatos[:10]])
+        await update.message.reply_text(
+            f"Encontré varias coincidencias:\n{lista}\n\nDecime el *código* exacto o especificá mejor (p. ej. 'pantalon clasico 42 verde').",
+            parse_mode="Markdown"
+        )
+        _set_pendiente(context, {"accion":accion,"cantidad":cantidad,"precio_venta":precio_venta,"filtro":filtro,"t":datetime.now().timestamp()})
         return
 
-    # 1 solo producto → ajustar
+    # === ÚNICO PRODUCTO → AJUSTAR ===
     prod = candidatos[0]
     delta = abs(cantidad) if accion == "agregar" else -abs(cantidad)
     new_stock = max(0, prod["Stock"] + delta)
@@ -381,35 +369,65 @@ async def _resolver_y_ajustar(update, context, accion, cantidad, precio_venta, f
     costo = float(prod["Costo"] or 0)
     _append_movement(ws_movs, tipo, prod, abs(delta), precio_v, costo)
 
+    # limpiar pendiente al terminar
+    _set_pendiente(context, None)
+
     msg = f"✅ {('Sumé' if delta>0 else 'Desconté')} {abs(delta)} de {prod['Producto']} {prod['Talle']} {prod['Color']} (stock {prod['Stock']}→{new_stock})"
     if tipo == "salida":
         msg += f"\nGanancia estimada: {_money((precio_v - costo)*abs(delta))}"
     await update.message.reply_text(msg)
 
+# ----------------- MENSAJES -----------------
 async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
+    text_nrm = _normalize(text)
     sh, ws_prod, ws_movs = _open_sheet()
     products, idx = _read_products(ws_prod)
 
-    # si estoy completando slots
     pending = _estado_pendiente(context)
-    if pending:
-        # actualizar el filtro con lo que respondió el usuario
-        t = _normalize(text)
-        slot = _siguiente_slot_faltante(pending["filtro"])
-        if slot:
-            # intentar mapear respuesta al catálogo
-            if slot == "Producto":
-                # permitir singular plural
-                pending["filtro"]["Producto"] = _pick_one_from(" "+_singularize(t)+" ", [_normalize(p["Producto"]) for p in products if p.get("Producto")])
-            elif slot == "Talle":
-                pending["filtro"]["Talle"] = t.strip()
-            elif slot == "Color":
-                pending["filtro"]["Color"] = _pick_one_from(" "+t+" ", [_normalize(p["Color"]) for p in products if p.get("Color")]) or t.strip()
-        # reintentar resolver
-        await _resolver_y_ajustar(update, context, pending["accion"], int(pending["cantidad"]), pending.get("precio_venta"), pending["filtro"], products, idx, ws_prod, ws_movs)
-        return
 
+    # Si hay pendiente, decidir si es respuesta de slot o nueva orden
+    if pending:
+        # Si el usuario responde con un CÓDIGO → elegir por código directo
+        if _is_probable_code(text):
+            prod = _find_by_code(text, products)
+            if prod:
+                accion = pending["accion"]
+                cantidad = int(pending["cantidad"])
+                precio_venta = pending.get("precio_venta")
+                delta = abs(cantidad) if accion == "agregar" else -abs(cantidad)
+                new_stock = max(0, prod["Stock"] + delta)
+                _update_stock(ws_prod, prod, new_stock, idx)
+                tipo = "entrada" if delta > 0 else "salida"
+                precio_v = float(precio_venta or prod["Precio"] or 0)
+                costo = float(prod["Costo"] or 0)
+                _append_movement(ws_movs, tipo, prod, abs(delta), precio_v, costo)
+                _set_pendiente(context, None)
+                msg = f"✅ {('Sumé' if delta>0 else 'Desconté')} {abs(delta)} de {prod['Producto']} {prod['Talle']} {prod['Color']} (stock {prod['Stock']}→{new_stock})"
+                if tipo == "salida":
+                    msg += f"\nGanancia estimada: {_money((precio_v - costo)*abs(delta))}"
+                await update.message.reply_text(msg)
+                return
+
+        # Si la respuesta parece UNA FRASE COMPLETA, tratamos como NUEVA ORDEN
+        if len(text_nrm.split()) >= 3:
+            _set_pendiente(context, None)
+        else:
+            # Respuesta breve al slot → completar filtro
+            slot = _siguiente_slot_faltante(pending["filtro"])
+            if slot:
+                t = text_nrm
+                if slot == "Producto":
+                    pending["filtro"]["Producto"] = _pick_one_from(" "+_singularize(t)+" ", [_normalize(p["Producto"]) for p in products if p.get("Producto")])
+                elif slot == "Talle":
+                    pending["filtro"]["Talle"] = t.strip()
+                elif slot == "Color":
+                    pending["filtro"]["Color"] = _pick_one_from(" "+t+" ", [_normalize(p["Color"]) for p in products if p.get("Color")]) or t.strip()
+                await _resolver_y_ajustar(update, context, pending["accion"], int(pending["cantidad"]), pending.get("precio_venta"), pending["filtro"], products, idx, ws_prod, ws_movs)
+                return
+            _set_pendiente(context, None)
+
+    # Nueva orden desde cero
     parsed = _nlp_parse(text)
     intent = parsed.get("intent")
     data = parsed.get("data", {})
@@ -423,20 +441,17 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _cmd_ganancias(update, context)
         return
 
-    # ajustar_stock
     accion = data.get("accion")
     cantidad = int(data.get("cantidad") or 1)
     precio_venta = data.get("precio_venta")
 
-    # extraer entidades desde el texto con catálogo real
+    # Forzar acción por señales claras en el texto
+    if re.search(r"\bcompr|agreg|sum", text_nrm):
+        accion = "agregar"
+    elif re.search(r"\bvend|descont|resta|salid", text_nrm):
+        accion = "descontar"
+
     filtro = _extract_entities_from_query(products, text)
-
-    # si falta acción, decidir por heurística (por defecto: venta = descontar)
-    if not accion:
-        accion = "descontar"  # elección conservadora si dice “vendí …”
-        if re.search(r"\bcompr|agreg|sum", _normalize(text)): accion = "agregar"
-
-    # si faltan slots, pregunto de a uno antes de fallar
     await _resolver_y_ajustar(update, context, accion, cantidad, precio_venta, filtro, products, idx, ws_prod, ws_movs)
 
 # ----------------- /ping /version /estado -----------------
@@ -465,7 +480,6 @@ async def _cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = []
-    # Sheets
     try:
         sh, ws_prod, ws_movs = _open_sheet()
         products, _ = _read_products(ws_prod)
@@ -481,7 +495,6 @@ async def _cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("📝 Últimos movimientos:" + ("\n  • " + "\n  • ".join(ult) if ult else " (sin registros)"))
     except Exception as e:
         lines.append(f"🧾 Sheets: ERROR → {e}")
-    # OpenAI
     try:
         if OPENAI_API_KEY and OpenAI:
             client = OpenAI(api_key=OPENAI_API_KEY)
@@ -499,7 +512,6 @@ def main():
         raise RuntimeError("Faltan variables de entorno.")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Comandos
     app.add_handler(CommandHandler("start", _cmd_start))
     app.add_handler(CommandHandler("reporte", _cmd_reporte))
     app.add_handler(CommandHandler("faltantes", _cmd_faltantes))
@@ -508,7 +520,6 @@ def main():
     app.add_handler(CommandHandler("version", _cmd_version))
     app.add_handler(CommandHandler("estado", _cmd_estado))
 
-    # Mensajes libres y aclaraciones (slot-filling)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
 
     log.info("Bot corriendo…")
