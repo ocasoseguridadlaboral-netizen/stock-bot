@@ -22,7 +22,8 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 SHEET_PRODUCTS_NAME = os.getenv("SHEET_PRODUCTS_NAME", "Productos")
 SHEET_MOVS_NAME = os.getenv("SHEET_MOVS_NAME", "Movimientos")
 
-PRODUCTS_HEADERS = ["Codigo", "Descripcion", "Producto", "Talle", "Color", "Costo", "Precio", "Stock", "Minimo", "SKU"]
+# Cabecera base; 'Categoria' es OPCIONAL (si existe, se usa)
+PRODUCTS_HEADERS = ["Codigo", "Categoria", "Producto", "Talle", "Color", "Costo", "Precio", "Stock", "Minimo", "SKU"]
 MOVS_HEADERS = ["Fecha", "Tipo", "Codigo", "Producto", "Talle", "Color", "Descripcion", "Cantidad", "PrecioVenta", "CostoUnitario", "Ganancia"]
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
@@ -40,7 +41,8 @@ def _normalize(s: str) -> str:
 _SINGULAR_MAP = {
     "pantalones":"pantalon", "botines":"botin", "zapatillas":"zapatilla",
     "medias":"media", "camisas":"camisa", "remeras":"remera", "jeans":"jean",
-    "gorras":"gorra", "camperas":"campera", "buzos":"buzo",
+    "gorras":"gorra", "camperas":"campera", "buzos":"buzo", "bermudas":"bermuda",
+    "shorts":"bermuda", "short":"bermuda"
 }
 def _singularize(word: str) -> str:
     w = _normalize(word)
@@ -56,7 +58,7 @@ def _money(x: float) -> str:
 
 def _is_probable_code(text: str) -> bool:
     t = _normalize(text)
-    return bool(re.fullmatch(r"[a-z0-9\-]{1,12}", t))
+    return bool(re.fullmatch(r"[a-z0-9\-]{1,20}", t))
 
 # ----------------- GOOGLE SHEETS -----------------
 def _gs_client():
@@ -93,25 +95,39 @@ def _read_products(ws):
     for r_i, row in enumerate(rows, start=2):
         if not any(row):
             continue
-        def get_text(col): return str(row[idx[col]]).strip() if col in idx and idx[col] < len(row) else ""
+
+        def get_text(col):
+            key = col.lower()
+            return str(row[idx[key]]).strip() if key in idx and idx[key] < len(row) else ""
+
         def get_num(col):
-            try: return float(str(row[idx[col]]).replace(",", ".") or 0)
+            key = col.lower()
+            try: return float(str(row[idx[key]]).replace(",", ".") or 0)
             except: return 0
+
         p = {
             "row": r_i,
-            "Codigo": get_text("codigo"),
-            "Descripcion": get_text("descripcion"),
-            "Producto": get_text("producto"),
-            "Talle": get_text("talle"),
-            "Color": get_text("color"),
-            "Costo": get_num("costo"),
-            "Precio": get_num("precio"),
-            "Stock": int(get_num("stock")),
-            "Minimo": int(get_num("minimo")),
-            "SKU": get_text("sku")
+            "Codigo": get_text("Codigo"),
+            "Categoria": get_text("Categoria") if "categoria" in idx else "",  # opcional
+            "Producto": get_text("Producto"),
+            "Talle": get_text("Talle"),
+            "Color": get_text("Color"),
+            "Costo": get_num("Costo"),
+            "Precio": get_num("Precio"),
+            "Stock": int(get_num("Stock")),
+            "Minimo": int(get_num("Minimo")),
+            "SKU": get_text("SKU")
         }
-        if p["Codigo"] or p["Descripcion"] or p["Producto"]:
-            products.append(p)
+        # Compatibilidad con tu esquema previo (sin Categoria): podías usar "Descripcion"
+        if not p["Categoria"] and "descripcion" in idx:
+            # heurística: si en Descripcion aparece una palabra tipo 'pantalon', 'bermuda'…
+            desc = _normalize(str(row[idx["descripcion"]]))
+            for w in ["pantalon","bermuda","botin","camisa","remera","campera","chaleco","buzo","zapatilla","guante","jean","gorra"]:
+                if re.search(rf"\b{w}\b", desc):
+                    p["Categoria"] = w
+                    break
+
+        products.append(p)
     return products, idx
 
 # ----------------- BÚSQUEDAS -----------------
@@ -122,11 +138,12 @@ def _find_by_code(code: str, products: List[Dict[str,Any]]) -> Optional[Dict[str
             return p
     return None
 
-def _catalogo_valores(products: List[Dict[str,Any]]) -> Tuple[List[str], List[str], List[str]]:
+def _catalogo_valores(products: List[Dict[str,Any]]) -> Tuple[List[str], List[str], List[str], List[str]]:
+    categorias = sorted({ _normalize(p.get("Categoria","")) for p in products if p.get("Categoria") }, key=len, reverse=True)
     prods = sorted({ _normalize(p.get("Producto","")) for p in products if p.get("Producto") }, key=len, reverse=True)
     colores = sorted({ _normalize(p.get("Color","")) for p in products if p.get("Color") }, key=len, reverse=True)
     talles = sorted({ _normalize(p.get("Talle","")) for p in products if p.get("Talle") }, key=len, reverse=True)
-    return prods, colores, talles
+    return categorias, prods, colores, talles
 
 def _pick_one_from(text_nrm: str, candidates: List[str]) -> Optional[str]:
     for c in candidates:
@@ -134,16 +151,24 @@ def _pick_one_from(text_nrm: str, candidates: List[str]) -> Optional[str]:
             return c
     return None
 
+def _detect_categoria_from_text(text_nrm: str) -> Optional[str]:
+    for w in ["pantalon","bermuda","botin","camisa","remera","campera","chaleco","buzo","zapatilla","guante","jean","gorra"]:
+        if re.search(rf"\b{w}s?\b", text_nrm):
+            return w
+    return None
+
 def _extract_entities_from_query(products: List[Dict[str,Any]], text: str) -> Dict[str, Optional[str]]:
     t = _normalize(text)
     tokens = [_singularize(tok) for tok in t.split()]
     t_sing = " ".join(tokens)
 
-    prods_cat, colores_cat, talles_cat = _catalogo_valores(products)
+    cats_cat, prods_cat, colores_cat, talles_cat = _catalogo_valores(products)
 
+    categoria = _pick_one_from(" " + t_sing + " ", cats_cat) or _detect_categoria_from_text(t_sing)
     producto = _pick_one_from(t_sing, prods_cat)
     color = _pick_one_from(t_sing, colores_cat)
 
+    # talle: por palabra clave o match directo
     m = re.search(r"\b(?:talle|t)\s*([a-z0-9\-]+)\b", t_sing)
     if m:
         talle = m.group(1)
@@ -155,14 +180,22 @@ def _extract_entities_from_query(products: List[Dict[str,Any]], text: str) -> Di
             if re.fullmatch(r"\d{2}", tok) and tok in talles_cat:
                 talle = tok; break
 
-    return {"Producto": producto, "Color": color, "Talle": talle}
+    # si el usuario dijo "codigo 79"
+    m2 = re.search(r"\bcod(?:igo)?\s*([a-z0-9\-]+)\b", t_sing)
+    codigo = m2.group(1) if m2 else None
+
+    return {"Categoria": categoria, "Producto": producto, "Talle": talle, "Color": color, "Codigo": codigo}
 
 def _filtrar_por_campos(products: List[Dict[str,Any]], f: Dict[str, Optional[str]]) -> List[Dict[str,Any]]:
     def ok(p, k):
         v = _normalize(p.get(k,""))
         q = _normalize(f.get(k) or "")
         return (not q) or (q and q == v)
-    return [p for p in products if ok(p,"Producto") and ok(p,"Color") and ok(p,"Talle")]
+    # Si hay código, devolvemos match exacto al código
+    if f.get("Codigo"):
+        p = _find_by_code(f["Codigo"], products)
+        return [p] if p else []
+    return [p for p in products if ok(p,"Categoria") and ok(p,"Producto") and ok(p,"Talle") and ok(p,"Color")]
 
 def _buscar_textual(products: List[Dict[str,Any]], query: str) -> List[Dict[str,Any]]:
     q = _normalize(query)
@@ -170,7 +203,7 @@ def _buscar_textual(products: List[Dict[str,Any]], query: str) -> List[Dict[str,
     out = []
     for p in products:
         texto = _normalize(" ".join([
-            p.get("Codigo",""), p.get("Descripcion",""), p.get("Producto",""),
+            p.get("Codigo",""), p.get("Categoria",""), p.get("Producto",""),
             p.get("Talle",""), p.get("Color",""), p.get("SKU","")
         ]))
         if q in texto or toks.issubset(set(texto.split())):
@@ -207,6 +240,14 @@ def _extraer_precio(text_nrm: str) -> Optional[float]:
             return None
     return None
 
+def _limpiar_codeblock(s: str) -> str:
+    s = s.strip()
+    if s.startswith("```"):
+        s = s.strip("`")
+        if s.startswith("json"):
+            s = s[4:].strip()
+    return s
+
 def _nlp_parse(text: str) -> Dict[str, Any]:
     t = _normalize(text)
     accion = _detectar_intencion(t)
@@ -214,13 +255,15 @@ def _nlp_parse(text: str) -> Dict[str, Any]:
     precio = _extraer_precio(t)
     base = {"intent":"ajustar_stock","data":{"accion":accion,"cantidad":cantidad,"query":text,"precio_venta":precio}}
 
+    # IA opcional: estructura JSON limpia
     if OPENAI_API_KEY and OpenAI:
         try:
             client = OpenAI(api_key=OPENAI_API_KEY)
             system = (
                 "Sos un parser de español para control de stock. "
                 "Devolvé JSON con 'intent' y 'data'. intents: 'ajustar_stock','reporte','faltantes','ganancias'. "
-                "Para 'ajustar_stock' incluí: {'accion':'agregar'|'descontar','cantidad':int,'query':str,'precio_venta':float|null}."
+                "Para 'ajustar_stock' incluí: {'accion':'agregar'|'descontar','cantidad':int,'query':str,'precio_venta':float|null, "
+                "'categoria':str,'producto':str,'talle':str,'color':str,'codigo':str}"
             )
             resp = client.chat.completions.create(
                 model=OPENAI_MODEL,
@@ -228,9 +271,11 @@ def _nlp_parse(text: str) -> Dict[str, Any]:
                 response_format={"type":"json_object"},
                 temperature=0
             )
-            data = json.loads(resp.choices[0].message.content)
+            content = _limpiar_codeblock(resp.choices[0].message.content or "")
+            data = json.loads(content)
             d = data.get("data",{})
             if not data.get("intent"): data["intent"] = "ajustar_stock"
+            # completar faltantes con heurísticas locales
             if not d.get("accion"): d["accion"] = accion
             if not d.get("cantidad"): d["cantidad"] = cantidad
             if "precio_venta" not in d: d["precio_venta"] = precio
@@ -243,7 +288,10 @@ def _nlp_parse(text: str) -> Dict[str, Any]:
 
 # ----------------- MOVIMIENTOS / STOCK -----------------
 def _update_stock(ws, prod, new_stock, idx):
-    col = (idx.get("stock") or 7) + 1
+    # col Stock (H) → índice según headers detectados
+    col = (idx.get("stock") or 7) + 1  # fallback a 'Precio' si faltara (pero headers estándar lo traen)
+    if "stock" in idx:
+        col = idx["stock"] + 1
     ws.update_cell(prod["row"], col, new_stock)
 
 def _append_movement(ws_movs, tipo, prod, cantidad, precio_venta, costo_unit):
@@ -251,7 +299,8 @@ def _append_movement(ws_movs, tipo, prod, cantidad, precio_venta, costo_unit):
     ganancia = (precio_venta - costo_unit) * abs(int(cantidad)) if tipo == "salida" else 0
     ws_movs.append_row([
         fecha, tipo, prod.get("Codigo",""), prod.get("Producto",""),
-        prod.get("Talle",""), prod.get("Color",""), prod.get("Descripcion",""),
+        prod.get("Talle",""), prod.get("Color",""),
+        prod.get("Categoria","") or "",  # en 'Descripcion' guardo la categoria/nota
         int(cantidad), float(precio_venta or 0), float(costo_unit or 0), float(ganancia)
     ])
 
@@ -267,47 +316,6 @@ def _sum_ganancias(ws_movs) -> float:
         except: pass
     return total
 
-# ----------------- HANDLERS BÁSICOS -----------------
-async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "👋 *Bot de Control de Stock*\n\n"
-        "Ejemplos:\n"
-        "• 'Sumá 3 pantalones verde 44'\n"
-        "• 'Vendí 2 botines negros 42 a $34000'\n"
-        "• 'Compré 5 pantalones verde clasico 44'\n"
-        "• 'Mostrame los faltantes' | 'Ganancias'\n\n"
-        "Comandos: /reporte, /faltantes, /ganancias, /ping, /version, /estado"
-    )
-    await update.message.reply_markdown(msg)
-
-async def _cmd_reporte(update, context):
-    _, ws, _ = _open_sheet()
-    products, _ = _read_products(ws)
-    if not products:
-        await update.message.reply_text("No hay productos cargados.")
-        return
-    text = "📊 *Reporte de stock:*\n"
-    for p in products:
-        text += f"- {p['Producto']} {p['Talle']} {p['Color']} | Stock: {p['Stock']} (mín: {p['Minimo']}) | Precio: {_money(p['Precio'])}\n"
-    await update.message.reply_markdown(text[:4000])
-
-async def _cmd_faltantes(update, context):
-    _, ws, _ = _open_sheet()
-    products, _ = _read_products(ws)
-    falt = [p for p in products if p["Stock"] <= p["Minimo"]]
-    if not falt:
-        await update.message.reply_text("✅ No hay faltantes.")
-        return
-    text = "🚨 *Bajo stock:*\n"
-    for p in falt:
-        text += f"- {p['Producto']} {p['Talle']} {p['Color']} ({p['Stock']} / mín {p['Minimo']})\n"
-    await update.message.reply_markdown(text[:4000])
-
-async def _cmd_ganancias(update, context):
-    _, _, ws_movs = _open_sheet()
-    total = _sum_ganancias(ws_movs)
-    await update.message.reply_text(f"💰 Ganancia total: {_money(total)}")
-
 # ----------------- SLOT-FILLING -----------------
 def _estado_pendiente(context: ContextTypes.DEFAULT_TYPE) -> Optional[Dict[str,Any]]:
     return context.user_data.get("pending_adjust")
@@ -319,20 +327,26 @@ def _set_pendiente(context: ContextTypes.DEFAULT_TYPE, data: Optional[Dict[str,A
         context.user_data["pending_adjust"] = data
 
 def _siguiente_slot_faltante(filtro: Dict[str, Optional[str]]) -> Optional[str]:
-    for k in ["Producto","Talle","Color"]:
+    for k in ["Categoria","Producto","Talle","Color"]:
         if not filtro.get(k):
             return k
     return None
 
 async def _preguntar_slot(update: Update, slot: str, products: List[Dict[str,Any]]):
-    if slot == "Producto":
-        await update.message.reply_text("¿Qué *producto* es? (ej. 'pantalon clasico')", parse_mode="Markdown")
+    if slot == "Categoria":
+        await update.message.reply_text("¿Es *pantalon*, *bermuda*, *botin*, etc.?", parse_mode="Markdown")
+    elif slot == "Producto":
+        await update.message.reply_text("¿Qué *producto* es? (ej. 'clasico', 'cargo')", parse_mode="Markdown")
     elif slot == "Talle":
         await update.message.reply_text("¿Qué *talle*?", parse_mode="Markdown")
     elif slot == "Color":
         await update.message.reply_text("¿Qué *color*?", parse_mode="Markdown")
     else:
         await update.message.reply_text("Necesito un dato más…")
+
+def _descripcion_corta(p: Dict[str,Any]) -> str:
+    cat = p.get("Categoria","") or ""
+    return f"{cat} {p.get('Producto','')} {p.get('Talle','')} {p.get('Color','')}".strip()
 
 async def _resolver_y_ajustar(update, context, accion, cantidad, precio_venta, filtro, products, idx, ws_prod, ws_movs):
     # 1) Intento por filtro exacto
@@ -347,11 +361,11 @@ async def _resolver_y_ajustar(update, context, accion, cantidad, precio_venta, f
             await _preguntar_slot(update, slot, products)
             _set_pendiente(context, {"accion":accion,"cantidad":cantidad,"precio_venta":precio_venta,"filtro":filtro,"t":datetime.now().timestamp()})
             return
-        await update.message.reply_text("No encontré coincidencias con esos datos. Indicá *producto, talle y color*.", parse_mode="Markdown")
+        await update.message.reply_text("No encontré coincidencias. Indicá *categoria, producto, talle y color*.", parse_mode="Markdown")
         return
 
     if len(candidatos) > 1:
-        lista = "\n".join([f"- {p['Producto']} {p['Talle']} {p['Color']} código: {p.get('Codigo') or 's/cod'}" for p in candidatos[:10]])
+        lista = "\n".join([f"- {_descripcion_corta(p)} código: {p.get('Codigo') or 's/cod'}" for p in candidatos[:10]])
         await update.message.reply_text(
             f"Encontré varias coincidencias:\n{lista}\n\nDecime el *código* exacto o especificá mejor (p. ej. 'pantalon clasico 42 verde').",
             parse_mode="Markdown"
@@ -369,26 +383,126 @@ async def _resolver_y_ajustar(update, context, accion, cantidad, precio_venta, f
     costo = float(prod["Costo"] or 0)
     _append_movement(ws_movs, tipo, prod, abs(delta), precio_v, costo)
 
-    # limpiar pendiente al terminar
-    _set_pendiente(context, None)
+    _set_pendiente(context, None)  # limpiar pendiente
 
-    msg = f"✅ {('Sumé' if delta>0 else 'Desconté')} {abs(delta)} de {prod['Producto']} {prod['Talle']} {prod['Color']} (stock {prod['Stock']}→{new_stock})"
-    if tipo == "salida":
+    msg = f"✅ {('Sumé' if delta>0 else 'Desconté')} {abs(delta)} de {_descripcion_corta(prod)} (stock {prod['Stock']}→{new_stock})"
+    if tipo == "salida" and precio_v and costo:
         msg += f"\nGanancia estimada: {_money((precio_v - costo)*abs(delta))}"
     await update.message.reply_text(msg)
 
+# ----------------- HANDLERS BÁSICOS -----------------
+async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "👋 *Bot de Control de Stock*\n\n"
+        "Ejemplos:\n"
+        "• 'Compré 4 pantalones cargo 50 verde'\n"
+        "• 'Vendí 2 bermudas cargo 50 verde a $34000'\n"
+        "• 'Código 79 vendí 1'\n"
+        "• 'Mostrame los faltantes' | 'Ganancias'\n\n"
+        "Comandos: /reporte, /faltantes, /ganancias, /agregar, /ping, /version, /estado"
+    )
+    await update.message.reply_markdown(msg)
+
+async def _cmd_reporte(update, context):
+    _, ws, _ = _open_sheet()
+    products, _ = _read_products(ws)
+    if not products:
+        await update.message.reply_text("No hay productos cargados.")
+        return
+    text = "📊 *Reporte de stock:*\n"
+    for p in products[:300]:
+        text += f"- {_descripcion_corta(p)} | Stock: {p['Stock']} (mín: {p['Minimo']}) | Precio: {_money(p['Precio'])}\n"
+    await update.message.reply_markdown(text[:4000])
+
+async def _cmd_faltantes(update, context):
+    _, ws, _ = _open_sheet()
+    products, _ = _read_products(ws)
+    falt = [p for p in products if p["Stock"] <= p["Minimo"]]
+    if not falt:
+        await update.message.reply_text("✅ No hay faltantes.")
+        return
+    text = "🚨 *Bajo stock:*\n"
+    for p in falt[:300]:
+        text += f"- {_descripcion_corta(p)} ({p['Stock']} / mín {p['Minimo']})\n"
+    await update.message.reply_markdown(text[:4000])
+
+async def _cmd_ganancias(update, context):
+    _, _, ws_movs = _open_sheet()
+    total = _sum_ganancias(ws_movs)
+    await update.message.reply_text(f"💰 Ganancia total: {_money(total)}")
+
+# /agregar: alta de fila completa con tu orden de columnas (Categoria opcional)
+async def _cmd_agregar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        # /agregar codigo,categoria,producto,talle,color,costo,precio,stock,minimo,sku
+        texto = " ".join(context.args)
+        partes = [p.strip() for p in texto.split(",")]
+        if len(partes) not in (9,10):
+            raise ValueError("Cantidad de campos inválida")
+
+        _, ws_prod, _ = _open_sheet()
+        values = ws_prod.get_all_values()
+        headers = [h.strip().lower() for h in values[0]] if values else []
+        has_categoria = "categoria" in headers
+
+        if len(partes) == 9:
+            # sin categoria
+            if has_categoria:
+                # insertar vacío en Categoria
+                partes = [partes[0], ""] + partes[1:]
+        else:
+            # 10 campos: ya trae categoria
+            if not has_categoria:
+                # descartar categoria si no existe columna
+                partes = [partes[0]] + partes[2:]
+
+        # casts numéricos (costo, precio, stock, minimo)
+        def to_float(x): 
+            try: return float(str(x).replace(",", "."))
+            except: return 0.0
+        def to_int(x):
+            try: return int(float(str(x).replace(",", ".")))
+            except: return 0
+
+        # Mapear por posición final: Codigo, [Categoria], Producto, Talle, Color, Costo, Precio, Stock, Minimo, SKU
+        if has_categoria and len(partes) != 10: raise ValueError("Se esperaban 10 campos (incluida Categoria).")
+        if not has_categoria and len(partes) != 9: raise ValueError("Se esperaban 9 campos (sin Categoria).")
+
+        # Costo/Precio/Stock/Minimo a tipos numéricos
+        if has_categoria:
+            partes[5] = to_float(partes[5])
+            partes[6] = to_float(partes[6])
+            partes[7] = to_int(partes[7])
+            partes[8] = to_int(partes[8])
+        else:
+            partes[5] = to_float(partes[5])
+            partes[6] = to_float(partes[6])
+            partes[7] = to_int(partes[7])
+            partes[8] = to_int(partes[8])
+
+        ws_prod.append_row(partes, value_input_option="USER_ENTERED")
+        await update.message.reply_text("✅ Producto agregado correctamente.")
+    except Exception as e:
+        log.error(f"/agregar error: {e}")
+        await update.message.reply_text(
+            "❌ Formato:\n/agregar codigo,categoria,producto,talle,color,costo,precio,stock,minimo,sku\n"
+            "Si tu hoja no tiene *Categoria*, omitila (9 campos)."
+        )
+
 # ----------------- MENSAJES -----------------
+def _estado_pendiente(context: ContextTypes.DEFAULT_TYPE) -> Optional[Dict[str,Any]]:
+    return context.user_data.get("pending_adjust")
+
 async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+    text = update.message.text or ""
     text_nrm = _normalize(text)
     sh, ws_prod, ws_movs = _open_sheet()
     products, idx = _read_products(ws_prod)
 
     pending = _estado_pendiente(context)
 
-    # Si hay pendiente, decidir si es respuesta de slot o nueva orden
+    # Si hay pendiente, intentar resolver por código o completar slot
     if pending:
-        # Si el usuario responde con un CÓDIGO → elegir por código directo
         if _is_probable_code(text):
             prod = _find_by_code(text, products)
             if prod:
@@ -397,37 +511,39 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 precio_venta = pending.get("precio_venta")
                 delta = abs(cantidad) if accion == "agregar" else -abs(cantidad)
                 new_stock = max(0, prod["Stock"] + delta)
+                # update & movimiento
                 _update_stock(ws_prod, prod, new_stock, idx)
                 tipo = "entrada" if delta > 0 else "salida"
                 precio_v = float(precio_venta or prod["Precio"] or 0)
                 costo = float(prod["Costo"] or 0)
                 _append_movement(ws_movs, tipo, prod, abs(delta), precio_v, costo)
-                _set_pendiente(context, None)
-                msg = f"✅ {('Sumé' if delta>0 else 'Desconté')} {abs(delta)} de {prod['Producto']} {prod['Talle']} {prod['Color']} (stock {prod['Stock']}→{new_stock})"
-                if tipo == "salida":
+                context.user_data.pop("pending_adjust", None)
+                msg = f"✅ {('Sumé' if delta>0 else 'Desconté')} {abs(delta)} de {_descripcion_corta(prod)} (stock {prod['Stock']}→{new_stock})"
+                if tipo == "salida" and precio_v and costo:
                     msg += f"\nGanancia estimada: {_money((precio_v - costo)*abs(delta))}"
                 await update.message.reply_text(msg)
                 return
 
-        # Si la respuesta parece UNA FRASE COMPLETA, tratamos como NUEVA ORDEN
-        if len(text_nrm.split()) >= 3:
-            _set_pendiente(context, None)
+        # Respuesta corta → completar slot
+        slot = _siguiente_slot_faltante(pending["filtro"])
+        if slot and len(text_nrm.split()) <= 3:
+            cats_cat, prods_cat, colores_cat, talles_cat = _catalogo_valores(products)
+            t = " " + " ".join(_singularize(tok) for tok in text_nrm.split()) + " "
+            if slot == "Categoria":
+                pending["filtro"]["Categoria"] = _pick_one_from(t, cats_cat) or _detect_categoria_from_text(t) or text_nrm.strip()
+            elif slot == "Producto":
+                pending["filtro"]["Producto"] = _pick_one_from(t, prods_cat) or text_nrm.strip()
+            elif slot == "Talle":
+                pending["filtro"]["Talle"] = text_nrm.strip()
+            elif slot == "Color":
+                pending["filtro"]["Color"] = _pick_one_from(t, colores_cat) or text_nrm.strip()
+            await _resolver_y_ajustar(update, context, pending["accion"], int(pending["cantidad"]), pending.get("precio_venta"), pending["filtro"], products, idx, ws_prod, ws_movs)
+            return
         else:
-            # Respuesta breve al slot → completar filtro
-            slot = _siguiente_slot_faltante(pending["filtro"])
-            if slot:
-                t = text_nrm
-                if slot == "Producto":
-                    pending["filtro"]["Producto"] = _pick_one_from(" "+_singularize(t)+" ", [_normalize(p["Producto"]) for p in products if p.get("Producto")])
-                elif slot == "Talle":
-                    pending["filtro"]["Talle"] = t.strip()
-                elif slot == "Color":
-                    pending["filtro"]["Color"] = _pick_one_from(" "+t+" ", [_normalize(p["Color"]) for p in products if p.get("Color")]) or t.strip()
-                await _resolver_y_ajustar(update, context, pending["accion"], int(pending["cantidad"]), pending.get("precio_venta"), pending["filtro"], products, idx, ws_prod, ws_movs)
-                return
-            _set_pendiente(context, None)
+            # Frase nueva completa → limpiar pendiente y seguir como nueva orden
+            context.user_data.pop("pending_adjust", None)
 
-    # Nueva orden desde cero
+    # Nueva orden
     parsed = _nlp_parse(text)
     intent = parsed.get("intent")
     data = parsed.get("data", {})
@@ -451,7 +567,15 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif re.search(r"\bvend|descont|resta|salid", text_nrm):
         accion = "descontar"
 
+    # Entidades: IA puede traerlas; si no, heurística local
     filtro = _extract_entities_from_query(products, text)
+
+    # Si IA devolvió campos, priorizalos
+    for k_src, k_dst in [("categoria","Categoria"), ("producto","Producto"), ("talle","Talle"), ("color","Color"), ("codigo","Codigo")]:
+        v = data.get(k_src)
+        if v and not filtro.get(k_dst):
+            filtro[k_dst] = _normalize(v)
+
     await _resolver_y_ajustar(update, context, accion, cantidad, precio_venta, filtro, products, idx, ws_prod, ws_movs)
 
 # ----------------- /ping /version /estado -----------------
@@ -509,13 +633,14 @@ async def _cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ----------------- MAIN -----------------
 def main():
     if not TELEGRAM_TOKEN or not GOOGLE_SHEET_ID:
-        raise RuntimeError("Faltan variables de entorno.")
+        raise RuntimeError("Faltan variables de entorno: TELEGRAM_TOKEN y/o GOOGLE_SHEET_ID.")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", _cmd_start))
     app.add_handler(CommandHandler("reporte", _cmd_reporte))
     app.add_handler(CommandHandler("faltantes", _cmd_faltantes))
     app.add_handler(CommandHandler("ganancias", _cmd_ganancias))
+    app.add_handler(CommandHandler("agregar", _cmd_agregar))
     app.add_handler(CommandHandler("ping", _cmd_ping))
     app.add_handler(CommandHandler("version", _cmd_version))
     app.add_handler(CommandHandler("estado", _cmd_estado))
