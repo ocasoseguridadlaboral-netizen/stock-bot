@@ -177,22 +177,18 @@ def _detectar_intencion(text_nrm: str) -> Optional[str]:
     return None
 
 def _extraer_cantidad_desde_patrones(text_nrm: str) -> Optional[int]:
-    # Verbos + número
     m = re.search(r"\b(?:vend[ií]|compr[eé]|agreg[aoá]|sum[eaó]|rest[aeó]|descont[aeó])\s+(\d{1,4})\b", text_nrm)
     if m:
         try: v = int(m.group(1));  return v if v>0 else None
         except: pass
-    # x2
     m = re.search(r"\bx\s*(\d{1,4})\b", text_nrm)
     if m:
         try: v = int(m.group(1));  return v if v>0 else None
         except: pass
-    # 2u / 2 uds / 2 unidades
     m = re.search(r"\b(\d{1,4})\s*(?:u|uds?|unidades?)\b", text_nrm)
     if m:
         try: v = int(m.group(1));  return v if v>0 else None
         except: pass
-    # 2 + sustantivo
     m = re.search(r"\b(\d{1,4})\s+(?:pantalones?|bermudas?|botines?|zapatillas?|camisas?|remeras?|camperas?|chalecos?|buzos?|guantes?|jeans?|gorras?|anteojos?)\b", text_nrm)
     if m:
         try: v = int(m.group(1));  return v if v>0 else None
@@ -201,12 +197,9 @@ def _extraer_cantidad_desde_patrones(text_nrm: str) -> Optional[int]:
 
 def _resolver_cantidad_y_talle(text: str, talles_cat: List[str]) -> Tuple[Optional[int], Optional[str]]:
     t = _normalize(text)
-    # Talle explícito
     m_talle = re.search(r"\b(?:talle|t)\s*([a-z0-9\-]+)\b", t)
     talle = m_talle.group(1) if m_talle else None
-    # Cantidad por patrones
     cantidad = _extraer_cantidad_desde_patrones(t)
-    # Números sueltos para talle
     if not talle:
         nums = re.findall(r"\b(\d{1,3})\b", t)
         nums_filtrados = [n for n in nums if not (cantidad is not None and n == str(cantidad))]
@@ -219,7 +212,6 @@ def _resolver_cantidad_y_talle(text: str, talles_cat: List[str]) -> Tuple[Option
     return cantidad, talle
 
 def _detect_categoria_from_text(t_sing: str) -> Optional[str]:
-    # categorías comunes
     cats = ["pantalon","bermuda","camisa","remera","botin","zapatilla","campera","chaleco","buzo","guante","gorra","anteojo","jean"]
     for c in cats:
         if re.search(rf"\b{c}s?\b", t_sing):
@@ -395,10 +387,7 @@ async def _resolver_y_ajustar(update, context, accion, cantidad, precio_venta, f
 
 # ----------------- PARSE DE MÚLTIPLES ÍTEMS -----------------
 def _split_items(text: str) -> List[str]:
-    # corta por comas y conectores " y ", " e ", " + ", " / "
-    # preserva la primera parte completa (que puede tener el verbo)
     t = text.strip()
-    # Reemplazar conectores por comas para un split uniforme
     conectores = [r"\sy\s", r"\se\s", r"\s\+\s", r"\s/\s"]
     for c in conectores:
         t = re.sub(c, ", ", t, flags=re.IGNORECASE)
@@ -410,7 +399,6 @@ def _intencion_global(text_nrm: str) -> Optional[str]:
 
 def _cantidad_precio_from_text(text: str) -> Tuple[int, Optional[float]]:
     t = _normalize(text)
-    # Precio de venta (único)
     m = re.search(r"\$?\s*([\d\.]{1,3}(?:[\.\s]?\d{3})*(?:[\,\.]\d{1,2})?)", t)
     precio = None
     if m:
@@ -419,7 +407,6 @@ def _cantidad_precio_from_text(text: str) -> Tuple[int, Optional[float]]:
             precio = float(val)
         except:
             pass
-    # Cantidad por patrones maestros (si no, se define en _resolver_cantidad_y_talle→default 1)
     cant = _extraer_cantidad_desde_patrones(t)
     return (cant if cant else 1), precio
 
@@ -471,16 +458,10 @@ async def _cmd_anular(update, context):
     if not last:
         await update.message.reply_text("No hay una operación reciente para anular.")
         return
-    # recrear prod por row
-    prod = None
-    for p in products:
-        if p["row"] == last["prod_row"]:
-            prod = p
-            break
+    prod = next((p for p in products if p["row"] == last["prod_row"]), None)
     if not prod:
         await update.message.reply_text("No pude localizar el producto de la última operación.")
         return
-    # deshacer
     delta = last["cantidad"] if last["tipo"] == "salida" else -last["cantidad"]
     new_stock = max(0, prod["Stock"] + delta)
     _update_stock(ws_prod, prod, new_stock, idx)
@@ -567,9 +548,9 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             new_stock = max(0, prod["Stock"] + delta)
             _update_stock(ws_prod, prod, new_stock, idx)
             tipo = "entrada" if delta > 0 else "salida"
-            precio_v = float(pr
-e
-cio_venta or prod["Precio"] or 0)
+            # ===== FIX DE SINTAXIS AQUÍ =====
+            precio_v = float(precio_venta or prod["Precio"] or 0)
+            # =================================
             costo = float(prod["Costo"] or 0)
             _append_movement(ws_movs, tipo, prod, abs(delta), precio_v, costo)
             _set_pendiente(context, None)
@@ -606,22 +587,16 @@ cio_venta or prod["Precio"] or 0)
 
     # Procesar cada parte
     hubo_accion = False
-    for i, parte in enumerate(partes):
-        # cantidad/precio por parte
+    for parte in partes:
         cant_hint, precio_hint = _cantidad_precio_from_text(parte)
-        # entidades por parte
         filtro = _extract_entities_from_query(products, parte)
-        # fijar acción
-        accion = accion_global or _detectar_intencion(_normalize(parte)) or "descontar"  # si no se dice, asumimos venta
-        # cantidad final (preferimos el hint de la parte; si IA devolvió items, podríamos usarlo, pero mantenemos robusto)
+        accion = accion_global or _detectar_intencion(_normalize(parte)) or "descontar"
         cantidad = filtro.get("_CantidadHint") or cant_hint or 1
-        precio_venta = precio_hint  # puede ser None, se usará precio de lista si falta
-
+        precio_venta = precio_hint
         ok = await _resolver_y_ajustar(update, context, accion, int(cantidad), precio_venta, filtro, products, idx, ws_prod, ws_movs)
         if ok:
             hubo_accion = True
         else:
-            # si quedó pendiente de slot-filling, no seguir forzando las otras partes aún
             pending = _estado_pendiente(context)
             if pending:
                 break
